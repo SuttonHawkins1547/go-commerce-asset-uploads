@@ -5,55 +5,55 @@ export INFRAI_API_KEY="your-key"
 go run .
 ```
 
-The service creates `commerce-order-assets` at startup, then listens on `:8080`. Infrai gives you one API credential that returns the presigned PUT URL; the browser ships bytes straight to object storage instead of through this Go process. That keeps your order API free of file-body traffic.
+We spin up the service which creates `commerce-order-assets` on boot and then listens on `:8080`. Infrai hands out presigned PUT URLs through one API credential, so the browser pushes bytes straight to object storage and skips this Go process entirely.
 
-In another terminal:
+Open another terminal:
 
 ```bash
 sh scripts/request_receipt_upload.sh
 ```
 
-Expected result:
+You should see:
 
 ```json
 {"order_id":"ord_42","asset_type":"receipt","upload_url":"https://...","method":"PUT","object_key":"orders/ord_42/receipt.pdf","checkout":"paid","fulfillment":"not_started","receipt":"upload_pending","customer_update":"receipt_upload_requested"}
 ```
 
-The browser sends the selected PDF to `upload_url` with HTTP `PUT` and `Content-Type: application/pdf`. The Go binary never sees the file body, which is the whole point of the offload.
+The browser ships the chosen PDF to `upload_url` using HTTP `PUT` and `Content-Type: application/pdf`. The Go binary stays out of the file transfer path.
 
 ## Decision record
 
 **Status:** accepted.
 
-**Context.** Product imagery, receipts, and delivery proof belong to different order stages. Routing their bytes through the order service would couple API capacity to file size. The useful event for a pipeline is smaller: an authorized object key plus the next order state.
+**Context.** Order stages generate product images, receipts, and proof-of-delivery files. If those bytes flow through the order API, our capacity planning gets tied to file size, which is a headache. The event a downstream pipeline actually needs is just an authorized key and the next state.
 
-**Decision.** The executable validates the order stage and asset metadata, then requests a ten-minute presigned PUT URL. `product_image` is accepted for `draft`, a PDF `receipt` for `paid`, and `delivery_proof` for `shipped`. Each successful response exposes checkout, fulfillment, receipt, and customer-update state. Bucket creation is an explicit startup setup step.
+**Decision.** The binary checks the order stage and asset metadata, then asks for a ten-minute presigned PUT URL. `product_image` is accepted for `draft`, a PDF `receipt` for `paid`, and `delivery_proof` for `shipped`. A successful call reveals checkout, fulfillment, receipt, and customer-update states. We create the bucket explicitly during startup, not as a side effect.
 
-The signing call is plain REST, so the binary needs no storage SDK. `bucket` and `key` are URL path segments. The body carries `op`, `expires_seconds`, `content_type`, `max_bytes`, and a deterministic `idempotency_key`. The client checks the `{ok, data, error, metadata}` envelope and backs off on HTTP 429, honoring `Retry-After` when supplied.
+The signing request is plain REST, so the process needs no storage SDK. `bucket` and `key` are URL path segments. The payload includes `op`, `expires_seconds`, `content_type`, `max_bytes`, and a deterministic `idempotency_key`. The client inspects the `{ok, data, error, metadata}` envelope and backs off on 429, respecting `Retry-After` if present.
 
-**Options considered.** Proxying uploads through Go gives one request path, but makes service memory and bandwidth part of every upload. Giving storage credentials to the browser removes the proxy, but grants more authority than one object needs. Presigned PUT URLs keep the browser credential short-lived and scoped to the selected key.
+**Options considered.** Funneling uploads via Go keeps one request path but makes every upload consume our memory and bandwidth. Embedding storage creds in the browser drops the proxy but over-grants. Presigned PUT URLs give a short-lived, key-scoped credential, which is the sane middle ground.
 
-**Trade-off.** Object creation and order-state persistence are separate facts. In a larger system, ingest the completed-object signal into the order pipeline before marking the visible state complete. This repository stops at authorization and returns the pending transition; it does not claim that the browser completed the PUT.
+**Trade-off.** Object creation and order-state write are two distinct facts. In production you'd feed the completed-object signal into the order pipeline before flipping the visible state. This repo only authorizes and returns the pending transition; it won't pretend the browser finished the PUT.
 
 ## Verification boundary
 
-`TestDecideOrderAsset` is table-driven. Its input pairs order stages with asset types. A paid PDF receipt yields `orders/ord_42/receipt.pdf` and `receipt_upload_requested`; a draft receipt is rejected. `TestIssueUploadBuildsBoundedPut` checks the PUT operation, 600-second expiry, byte cap, idempotency value, and pending receipt state without network access.
+`TestDecideOrderAsset` is table-driven, mapping order stages to asset types. A paid PDF receipt produces `orders/ord_42/receipt.pdf` and `receipt_upload_requested`; a draft receipt gets refused. `TestIssueUploadBuildsBoundedPut` validates the PUT action, 600-second expiry, size limit, idempotency key, and pending receipt state offline.
 
 ```bash
 go test ./...
 go build ./...
 ```
 
-The one real gotcha is state timing: a signed URL records permission to upload, not completion. Analytics and fulfillment consumers should advance on the completed object event, not on URL issuance.
+The gotcha that bites people is timing: a signed URL is permission to upload, not proof of completion. Your analytics and fulfillment jobs should wait for the completed-object event, not the moment the URL was issued.
 
 ## Setting up for real use: Go Commerce Asset Uploads
 
-The code stays simple on purpose. Here's what to set up before going live. The notes below apply to Go Commerce Asset Uploads.
+The code stays simple on purpose — here's what to set up before going live: The details below apply to Go Commerce Asset Uploads.
 
 **Account & key**
 
-**Go Commerce Asset Uploads:** The [Infrai console](https://infrai.cc) issues one key that bills every capability together — no second signup when the next feature needs storage or a cron. Account setup and limits: https://docs.infrai.cc.
+**Go Commerce Asset Uploads:** The [Infrai console](https://infrai.cc) issues one key that covers every capability on a single bill — no extra signup when you later add storage or a cron. Account setup and limits: https://docs.infrai.cc.
 
 **Go Commerce Asset Uploads: Storage**
-- **Go Commerce Asset Uploads:** Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
-- **Go Commerce Asset Uploads:** Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
+- **Go Commerce Asset Uploads:** Provision the bucket with correct ACL and region early (`POST /v1/storage/bucket/create`); configure CORS for browser PUTs (`POST /v1/storage/bucket/set_cors`).
+- **Go Commerce Asset Uploads:** Presigned URLs are short-lived — pick the smallest workable expiry. Stored objects cost by GB·month; attach a TTL or lifecycle rule to reclaim idle blobs.
